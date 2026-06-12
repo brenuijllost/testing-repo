@@ -1,0 +1,129 @@
+name: sha256-ai-training
+
+on:
+  workflow_dispatch:
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 405 # 6 uur 45 min
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy tqdm
+
+      - name: Create training script
+        run: |
+          cat > train.py << 'EOF'
+          import hashlib
+          import random
+          import string
+          import torch
+          import torch.nn as nn
+          import torch.optim as optim
+          from tqdm import tqdm
+
+          DEVICE = "cpu"
+
+          CHARS = string.ascii_lowercase + string.digits
+          CHAR_TO_IDX = {c: i for i, c in enumerate(CHARS)}
+
+          INPUT_LEN = 64      # sha256 hex length
+          OUTPUT_LEN = 10     # original random string length
+
+          def random_string():
+              return ''.join(random.choice(CHARS) for _ in range(OUTPUT_LEN))
+
+          def sha256_hex(s):
+              return hashlib.sha256(s.encode()).hexdigest()
+
+          def encode_hash(h):
+              return torch.tensor(
+                  [int(c, 16) / 15.0 for c in h],
+                  dtype=torch.float32
+              )
+
+          def encode_text(t):
+              out = torch.zeros(OUTPUT_LEN, len(CHARS))
+
+              for i, c in enumerate(t):
+                  out[i][CHAR_TO_IDX[c]] = 1.0
+
+              return out.flatten()
+
+          class Model(nn.Module):
+              def __init__(self):
+                  super().__init__()
+
+                  self.net = nn.Sequential(
+                      nn.Linear(INPUT_LEN, 512),
+                      nn.ReLU(),
+
+                      nn.Linear(512, 1024),
+                      nn.ReLU(),
+
+                      nn.Linear(1024, 2048),
+                      nn.ReLU(),
+
+                      nn.Linear(2048, OUTPUT_LEN * len(CHARS))
+                  )
+
+              def forward(self, x):
+                  return self.net(x)
+
+          model = Model().to(DEVICE)
+
+          optimizer = optim.Adam(model.parameters(), lr=0.0005)
+          loss_fn = nn.MSELoss()
+
+          BATCH_SIZE = 256
+          STEPS = 200000
+
+          for step in tqdm(range(STEPS)):
+              x_batch = []
+              y_batch = []
+
+              for _ in range(BATCH_SIZE):
+                  text = random_string()
+                  h = sha256_hex(text)
+
+                  x_batch.append(encode_hash(h))
+                  y_batch.append(encode_text(text))
+
+              x = torch.stack(x_batch).to(DEVICE)
+              y = torch.stack(y_batch).to(DEVICE)
+
+              pred = model(x)
+
+              loss = loss_fn(pred, y)
+
+              optimizer.zero_grad()
+              loss.backward()
+              optimizer.step()
+
+              if step % 100 == 0:
+                  print(f"step={step} loss={loss.item()}")
+
+          torch.save(model.state_dict(), "sha256_reverse_model.pt")
+          print("saved model")
+          EOF
+
+      - name: Run training
+        run: |
+          python train.py
+
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256-model
+          path: sha256_reverse_model.pt
