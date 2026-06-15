@@ -1,0 +1,99 @@
+name: sha256-ai-verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      plaintext:
+        description: "Enter a 10‑character test string (a-z0-9)"
+        required: true
+        type: string
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Create verify script
+        run: |
+          cat > verify.py << 'EOF'
+          import torch
+          import torch.nn as nn
+          import string
+          import hashlib
+          import sys
+
+          CHARS = string.ascii_lowercase + string.digits
+          CHAR_TO_IDX = {c: i for i, c in enumerate(CHARS)}
+          IDX_TO_CHAR = {i: c for c, i in CHAR_TO_IDX.items()}
+
+          INPUT_LEN = 64
+          OUTPUT_LEN = 10
+
+          def sha256_hex(s):
+              return hashlib.sha256(s.encode()).hexdigest()
+
+          def encode_hash(h):
+              return torch.tensor([int(c, 16) / 15.0 for c in h], dtype=torch.float32)
+
+          def decode_output(vec):
+              vec = vec.reshape(OUTPUT_LEN, len(CHARS))
+              idxs = torch.argmax(vec, dim=1).tolist()
+              return ''.join(IDX_TO_CHAR[i] for i in idxs)
+
+          class Model(nn.Module):
+              def __init__(self):
+                  super().__init__()
+                  self.net = nn.Sequential(
+                      nn.Linear(INPUT_LEN, 512),
+                      nn.ReLU(),
+                      nn.Linear(512, 1024),
+                      nn.ReLU(),
+                      nn.Linear(1024, 2048),
+                      nn.ReLU(),
+                      nn.Linear(2048, OUTPUT_LEN * len(CHARS))
+                  )
+
+              def forward(self, x):
+                  return self.net(x)
+
+          # Load model
+          model = Model()
+          model.load_state_dict(torch.load("sha256_reverse_model.pt", map_location="cpu"))
+          model.eval()
+
+          # Read plaintext from workflow input
+          plaintext = sys.argv[1].strip().lower()
+
+          if len(plaintext) != 10 or any(c not in CHARS for c in plaintext):
+              print("Invalid plaintext. Must be 10 chars from a-z0-9.")
+              sys.exit(1)
+
+          h = sha256_hex(plaintext)
+          print("SHA256:", h)
+
+          x = encode_hash(h).unsqueeze(0)
+
+          with torch.no_grad():
+              pred = model(x)[0]
+
+          guess = decode_output(pred)
+
+          print("Model guess:", guess)
+          print("Match:", guess == plaintext)
+          EOF
+
+      - name: Run verification
+        run: |
+          python verify.py "${{ github.event.inputs.plaintext }}"
